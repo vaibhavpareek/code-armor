@@ -1,0 +1,168 @@
+pipeline {
+    agent any
+
+    parameters {
+        string(name: 'repo_name', defaultValue: '', description: 'Enter the repository name')
+        string(name: 'branch_name', defaultValue: '', description: 'Enter the branch name to analyze')
+    }
+
+    stages {
+        stage('Initialize') {
+            steps {
+                wrap([$class: 'BuildUser']) {
+                    echo "Initializing Bandit analysis for Repository: ${params.repo_name}, Branch: ${params.branch_name}"
+                }
+            }
+        }
+
+        stage('Validate Parameters') {
+            steps {
+                script {
+                    if (params.repo_name.isEmpty() || params.branch_name.isEmpty()) {
+                        error("Build failed because Repository Name or Branch Name is empty.")
+                    } else {
+                        echo "Repository Name: ${params.repo_name}"
+                        echo "Branch Name: ${params.branch_name}"
+                    }
+                }
+            }
+        }
+
+        stage('Fetch and Checkout Branch via Bitbucket API') {
+            steps {
+                script {
+                    def bitbucketApiUrl = "https://api.bitbucket.org/2.0/repositories/<company-name>/${params.repo_name}/refs/branches/${params.branch_name}/diff"
+                    
+                    withCredentials([usernamePassword(credentialsId: '<USERNAME>', usernameVariable: 'username', passwordVariable: 'password')]) {
+                        def cloneCommand = """
+                            git clone https://${USERNAME}:${PASSWORD}@bitbucket.org/<company-name>/${env.repo_name}.git
+                            cd ${params.repo_name}
+                            git checkout ${params.branch_name}
+                            
+                            # Fetch the base branch
+                            git fetch origin master
+                            
+                            # Generate the diff between the current branch and the base branch
+                            git diff --name-only origin/master..HEAD | tee changed_files.txt
+                        """
+                        def response = sh(script: cloneCommand, returnStdout: true, returnStatus: true)
+                        
+                        if (response != 0) {
+                            error "Failed to fetch and checkout branch. Bitbucket API response indicates an error."
+                        } else {
+                            echo "Branch checked out successfully."
+                        }
+                    }
+                }
+            }
+        }
+
+
+        stage('Setup Virtual Environment') {
+            steps {
+                script {
+                    sh '''
+                        python3 -m venv venv
+                        . venv/bin/activate
+                        pip3 install --upgrade pip
+                        pip3 install bandit==1.7.0 pylint
+                    '''
+                }
+            }
+        }
+
+        stage('Run Bandit on Changed Files') {
+            steps {
+                script {
+                    sh """
+                        . venv/bin/activate  # Ensure the virtual environment is activated
+                        cd ${params.repo_name}
+                        echo "------bandit scan started-----" 
+                        bandit \$(cat changed_files.txt) -f json -o bandit-report.json --exit-zero
+                        echo "------bandit scan completed-----" 
+                    """
+                }
+            }
+        }
+
+        stage('Check for High/Critical Issues') {
+            steps {
+                script {
+                    def checkIssuesCommand = """
+                        echo "Running Processing for Bandit report"
+                        critical_count=\$(jq '[.results[] | select(.issue_severity == "CRITICAL")] | length' ${params.repo_name}/bandit-report.json)
+                        high_count=\$(jq '[.results[] | select(.issue_severity == "HIGH")] | length' ${params.repo_name}/bandit-report.json)
+
+                        if [ "\$critical_count" -gt 0 ] || [ "\$high_count" -gt 0 ]; then
+                            echo "Critical Issues: \$critical_count"
+                            echo "High Issues: \$high_count"
+                            echo "Bandit Report:"
+                            cat ${params.repo_name}/bandit-report.json
+                            exit 1
+                        else
+                            echo "------- Report ----------"
+                            cat ${params.repo_name}/bandit-report.json
+                            echo "----- Report Done ---------"
+                            echo "No high or critical issues found."
+                        fi
+                    """
+                    sh script: checkIssuesCommand, returnStatus: true
+                }
+            }
+        }
+
+        stage('Run Pylint on Changed Files') {
+            steps {
+                script {
+                    sh """
+                        . venv/bin/activate  # Ensure the virtual environment is activated
+                        cd ${params.repo_name}
+                        echo "------pylint scan started-----"
+                        pylint \$(cat changed_files.txt) --output-format=json | tee pylint-report.json || true
+                        echo "------pylint scan completed-----"
+                    """
+                }
+            }
+        }
+
+
+        stage('Semgrep Security Scan') {
+            steps {
+                script {
+                    // Prepend /src/ to each line in changed_files.txt and save it to a temporary file
+                    sh """
+                    sed 's|^|/src/${params.repo_name}/|' ${params.repo_name}/changed_files.txt | tee ${params.repo_name}/changed_files_with_src.txt
+                    """
+
+                    // Run Semgrep using Docker with the constructed file paths
+                    sh """
+                    docker run --rm \
+                    -v "\${WORKSPACE}:/src" \
+                    returntocorp/semgrep semgrep \
+                    --config https://semgrep.dev/p/django \
+                    --config https://semgrep.dev/p/python \$(cat ${params.repo_name}/changed_files_with_src.txt) --json --output /src/${params.repo_name}/semgrep-report.json
+                    """
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            archiveArtifacts artifacts: "${params.repo_name}/bandit-report.json", allowEmptyArchive: true
+            archiveArtifacts artifacts: "${params.repo_name}/pylint-report.json", allowEmptyArchive: true
+            archiveArtifacts artifacts: "${params.repo_name}/semgrep-report.json", allowEmptyArchive: true
+            // Clean up cloned repository
+            script {
+                echo "Cleaning up workspace..."
+                sh "rm -rf ${params.repo_name}"
+            }
+        }
+        success {
+            echo "Security analysis successful, no critical vulnerabilities found."
+        }
+        failure {
+            echo "Build failed due to critical vulnerabilities in the repository."
+        }
+    }
+}
